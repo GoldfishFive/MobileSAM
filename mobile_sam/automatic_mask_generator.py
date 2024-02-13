@@ -370,3 +370,88 @@ class SamAutomaticMaskGenerator:
         mask_data.filter(keep_by_nms)
 
         return mask_data
+
+ # Individual Prompting by LBK
+    @torch.no_grad()
+    def individual_generate(
+        self, 
+        image: np.ndarray, 
+        points_for_image: np.array,
+        ) -> List[Dict[str, Any]]:
+
+        def _individual_process_crop(
+            image: np.ndarray,
+            img_box: List[int],
+            orig_size: Tuple[int, ...],
+        ) -> MaskData:
+            # Crop the image and calculate embeddings
+            im_size = image.shape[:2]
+            self.predictor.set_image(image)
+
+            # Generate masks for this crop in batches
+            data = MaskData()
+            for (points,) in batch_iterator(self.points_per_batch, points_for_image):
+                batch_data = self._process_batch(points, im_size, img_box, orig_size)
+                data.cat(batch_data)
+                del batch_data
+            self.predictor.reset_image()
+
+            # Remove duplicates within this crop.
+            keep_by_nms = batched_nms(
+                data["boxes"].float(),
+                data["iou_preds"],
+                torch.zeros_like(data["boxes"][:, 0]),  # categories
+                iou_threshold=self.box_nms_thresh,
+            )
+            data.filter(keep_by_nms)
+
+            # Return to the original image frame
+            data["boxes"] = uncrop_boxes_xyxy(data["boxes"], img_box)
+            data["points"] = uncrop_points(data["points"], img_box)
+            data["crop_boxes"] = torch.tensor([img_box for _ in range(len(data["rles"]))])
+
+            return data
+
+        def _individual_generate_masks(image: np.ndarray)-> MaskData:
+            im_h, im_w = image.shape[:2]
+
+            # Iterate over image crops
+            data = MaskData()
+            data.cat(_individual_process_crop(image, [0, 0, im_w, im_h], (im_h, im_w)))
+            data.to_numpy()
+            return data
+
+        # Generate masks
+        mask_data = _individual_generate_masks(image)
+
+        # Filter small disconnected regions and holes in masks
+        if self.min_mask_region_area > 0:
+            mask_data = self.postprocess_small_regions(
+                mask_data,
+                self.min_mask_region_area,
+                max(self.box_nms_thresh, self.crop_nms_thresh),
+            )
+
+        # Encode masks
+        if self.output_mode == "coco_rle":
+            mask_data["segmentations"] = [coco_encode_rle(rle) for rle in mask_data["rles"]]
+        elif self.output_mode == "binary_mask":
+            mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
+        else:
+            mask_data["segmentations"] = mask_data["rles"]
+
+        # Write mask records
+        curr_anns = []
+        for idx in range(len(mask_data["segmentations"])):
+            ann = {
+                "segmentation": mask_data["segmentations"][idx],
+                "area": area_from_rle(mask_data["rles"][idx]),
+                "bbox": box_xyxy_to_xywh(mask_data["boxes"][idx]).tolist(),
+                "predicted_iou": mask_data["iou_preds"][idx].item(),
+                "point_coords": [mask_data["points"][idx].tolist()],
+                "stability_score": mask_data["stability_score"][idx].item(),
+                "crop_box": box_xyxy_to_xywh(mask_data["crop_boxes"][idx]).tolist(),
+            }
+            curr_anns.append(ann)
+
+        return curr_anns

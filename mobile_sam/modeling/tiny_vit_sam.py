@@ -16,7 +16,7 @@ from timm.models.layers import DropPath as TimmDropPath,\
     to_2tuple, trunc_normal_
 from timm.models.registry import register_model
 from typing import Tuple
-
+import math
 
 class Conv2d_BN(torch.nn.Sequential):
     def __init__(self, a, b, ks=1, stride=1, pad=0, dilation=1,
@@ -340,7 +340,11 @@ class TinyViTBlock(nn.Module):
         if H == self.window_size and W == self.window_size:
             x = self.attn(x)
         else:
-            x = x.view(B, H, W, C)
+            # LBK EDIT
+            x = F.interpolate(x.view(B, int(math.sqrt(L)), int(math.sqrt(L)), C).permute(0, 3, 1, 2),
+                              size=(H, W),
+                              mode='bilinear').permute(0, 2, 3, 1)
+            # x = x.view(B, H, W, C) # Original SAM
             pad_b = (self.window_size - H %
                      self.window_size) % self.window_size
             pad_r = (self.window_size - W %
@@ -363,12 +367,18 @@ class TinyViTBlock(nn.Module):
 
             if padding:
                 x = x[:, :H, :W].contiguous()
-
+            
+            # LBK EDIT
+            x = F.interpolate(x.permute(0, 3, 1, 2),
+                              size=(int(math.sqrt(L)), int(math.sqrt(L))),
+                              mode='bilinear').permute(0, 2, 3, 1)
+            
             x = x.view(B, L, C)
 
         x = res_x + self.drop_path(x)
 
-        x = x.transpose(1, 2).reshape(B, C, H, W)
+        # x = x.transpose(1, 2).reshape(B, C, H, W) # Original SAM
+        x = x.transpose(1, 2).reshape(B, C, int(math.sqrt(L)), int(math.sqrt(L))) # LBK EDIT
         x = self.local_conv(x)
         x = x.view(B, C, L).transpose(1, 2)
 
@@ -608,7 +618,9 @@ class TinyViT(nn.Module):
             layer = self.layers[i]
             x = layer(x)
         B,_,C=x.size()
-        x = x.view(B, 64, 64, C)
+
+        # x = x.view(B, 64, 64, C)
+        x = x.view(B, 32, 32, C) # by wjy input 512*512 images
         x=x.permute(0, 3, 1, 2)
         x=self.neck(x)
         return x
